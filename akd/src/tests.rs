@@ -12,7 +12,7 @@ use crate::{
     auditor::audit_verify,
     client::{key_history_verify, lookup_verify},
     directory::{get_key_history_hashes, Directory},
-    ecvrf::{HardCodedAkdVRF, VRFKeyStorage},
+    ecvrf::HardCodedAkdVRF,
     errors::AkdError,
     storage::{
         memory::AsyncInMemoryDatabase,
@@ -473,87 +473,6 @@ async fn test_directory_read_only_mode() -> Result<(), AkdError> {
     let akd = Directory::<_, _>::new::<Blake3>(&db, &vrf, true).await?;
     assert!(matches!(akd.publish::<Blake3>(vec![]).await, Err(_)));
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_directory_polling_azks_change() -> Result<(), AkdError> {
-    let db = AsyncInMemoryDatabase::new();
-    let vrf = HardCodedAkdVRF {};
-    // writer will write the AZKS record
-    let writer = Directory::<_, _>::new::<Blake3>(&db, &vrf, false).await?;
-
-    writer
-        .publish::<Blake3>(vec![
-            (
-                AkdLabel::from_utf8_str("hello"),
-                AkdValue::from_utf8_str("world"),
-            ),
-            (
-                AkdLabel::from_utf8_str("hello2"),
-                AkdValue::from_utf8_str("world2"),
-            ),
-        ])
-        .await?;
-
-    // reader will not write the AZKS but will be "polling" for AZKS changes
-    let reader = Directory::<_, _>::new::<Blake3>(&db, &vrf, true).await?;
-
-    // start the poller
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-    let reader_clone = reader.clone();
-    let _join_handle = tokio::task::spawn(async move {
-        reader_clone
-            .poll_for_azks_changes(tokio::time::Duration::from_millis(100), Some(tx))
-            .await
-    });
-
-    // verify a lookup proof, which will populate the cache
-    async_poll_helper_proof(&reader, AkdValue::from_utf8_str("world")).await?;
-
-    // publish epoch 2
-    writer
-        .publish::<Blake3>(vec![
-            (
-                AkdLabel::from_utf8_str("hello"),
-                AkdValue::from_utf8_str("world_2"),
-            ),
-            (
-                AkdLabel::from_utf8_str("hello2"),
-                AkdValue::from_utf8_str("world2_2"),
-            ),
-        ])
-        .await?;
-
-    // assert that the change is picked up in a reasonable time-frame and the cache is flushed
-    let notification = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;
-    assert!(matches!(notification, Ok(Some(()))));
-
-    async_poll_helper_proof(&reader, AkdValue::from_utf8_str("world_2")).await?;
-
-    Ok(())
-}
-
-/*
-=========== Test Helpers ===========
-*/
-
-async fn async_poll_helper_proof<T: Storage + Sync + Send, V: VRFKeyStorage>(
-    reader: &Directory<T, V>,
-    value: AkdValue,
-) -> Result<(), AkdError> {
-    // reader should read "hello" and this will populate the "cache" a log
-    let lookup_proof = reader.lookup(AkdLabel::from_utf8_str("hello")).await?;
-    assert_eq!(value, lookup_proof.plaintext_value);
-    let current_azks = reader.retrieve_current_azks().await?;
-    let root_hash = reader.get_root_hash::<Blake3>(&current_azks).await?;
-    let pk = reader.get_public_key().await?;
-    lookup_verify::<Blake3>(
-        &pk,
-        root_hash,
-        AkdLabel::from_utf8_str("hello"),
-        lookup_proof,
-    )?;
     Ok(())
 }
 

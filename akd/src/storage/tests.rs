@@ -7,6 +7,7 @@
 
 //! Test utilities of storage layers implementing the storage primatives for AKD
 
+use crate::ecvrf::VRFKeyStorage;
 use crate::errors::StorageError;
 use crate::history_tree_node::*;
 use crate::node_state::*;
@@ -18,6 +19,10 @@ use tokio::time::{Duration, Instant};
 
 type Azks = crate::append_only_zks::Azks;
 type HistoryTreeNode = crate::history_tree_node::HistoryTreeNode;
+
+use winter_crypto::hashers::Blake3_256;
+use winter_math::fields::f128::BaseElement;
+type Blake3 = Blake3_256<BaseElement>;
 
 // *** Tests *** //
 
@@ -45,13 +50,18 @@ mod memory_storage_tests {
 /// Run the storage-layer test suite for a given storage implementation.
 /// This is public because it can be used by other implemented storage layers
 /// for consistency checks (e.g. mysql, memcached, etc)
-pub async fn run_test_cases_for_storage_impl<S: Storage + Sync + Send>(db: &S) {
+pub async fn run_test_cases_for_storage_impl<S: Storage + Sync + Send + 'static>(db: &S) {
     crate::test_utils::init_logger(log::Level::Info);
+    // this test must be first, because after we're screwing with the storage layouts
+    // and the directory structure is broken. Here we're using a _real_ directory, so
+    // we need it to be a "clean" data-layer
+    test_directory_polling_azks_change(db).await;
+
     test_get_and_set_item(db).await;
     test_user_data(db).await;
     test_transactions(db).await;
     test_batch_get_items(db).await;
-    test_tombstoning_data(db).await.unwrap();
+    test_tombstoning_data(db).await;
 }
 
 // *** New Test Helper Functions *** //
@@ -589,7 +599,7 @@ async fn test_user_data<S: Storage + Sync + Send>(storage: &S) {
 
 async fn test_tombstoning_data<S: Storage + Sync + Send>(
     storage: &S,
-) -> Result<(), crate::errors::AkdError> {
+){
     let rand_user = thread_rng()
         .sample_iter(&Alphanumeric)
         .take(30)
@@ -650,7 +660,7 @@ async fn test_tombstoning_data<S: Storage + Sync + Send>(
     ];
 
     // tombstone the given states
-    storage.tombstone_value_states(&keys_to_tombstone).await?;
+    storage.tombstone_value_states(&keys_to_tombstone).await.unwrap();
 
     for label in [
         AkdLabel::from_utf8_str("tombstone_test_user"),
@@ -658,7 +668,7 @@ async fn test_tombstoning_data<S: Storage + Sync + Send>(
     ] {
         for version in 0..5 {
             let key = ValueStateKey(label.to_vec(), version);
-            let got = storage.get::<ValueState>(&key).await?;
+            let got = storage.get::<ValueState>(&key).await.unwrap();
 
             if let DbRecord::ValueState(value_state) = got {
                 assert_eq!(version, value_state.epoch);
@@ -674,5 +684,88 @@ async fn test_tombstoning_data<S: Storage + Sync + Send>(
             }
         }
     }
-    Ok(())
+}
+
+async fn test_directory_polling_azks_change<S: Storage + Sync + Send + 'static>(
+    db: &S,
+) {
+    let vrf = crate::ecvrf::HardCodedAkdVRF {};
+    // writer will write the AZKS record
+    let writer = crate::Directory::<_, _>::new::<Blake3>(db, &vrf, false)
+        .await
+        .unwrap();
+
+    writer
+        .publish::<Blake3>(vec![
+            (
+                AkdLabel::from_utf8_str("polling_hello"),
+                AkdValue::from_utf8_str("polling_world"),
+            ),
+            (
+                AkdLabel::from_utf8_str("polling_hello2"),
+                AkdValue::from_utf8_str("polling_world2"),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    // reader will not write the AZKS but will be "polling" for AZKS changes
+    let reader = crate::Directory::<_, _>::new::<Blake3>(db, &vrf, true)
+        .await
+        .unwrap();
+
+    // start the poller
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let reader_clone = reader.clone();
+    let _join_handle = tokio::task::spawn(async move {
+        reader_clone
+            .poll_for_azks_changes(tokio::time::Duration::from_millis(100), Some(tx))
+            .await
+    });
+
+    // verify a lookup proof, which will populate the cache
+    async_poll_helper_proof::<S, _>(&reader, AkdValue::from_utf8_str("polling_world")).await;
+
+    // publish epoch 2
+    writer
+        .publish::<Blake3>(vec![
+            (
+                AkdLabel::from_utf8_str("polling_hello"),
+                AkdValue::from_utf8_str("polling_world_2"),
+            ),
+            (
+                AkdLabel::from_utf8_str("polling_hello2"),
+                AkdValue::from_utf8_str("polling_world2_2"),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    // assert that the change is picked up in a reasonable time-frame and the cache is flushed
+    let notification = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;
+    assert!(matches!(notification, Ok(Some(()))));
+
+    async_poll_helper_proof::<S, _>(&reader, AkdValue::from_utf8_str("polling_world_2")).await;
+}
+
+async fn async_poll_helper_proof<T: Storage + Sync + Send, V: VRFKeyStorage>(
+    reader: &crate::Directory<T, V>,
+    value: AkdValue,
+) {
+    // reader should read "hello" and this will populate the "cache" a log
+    let lookup_proof = reader
+        .lookup(AkdLabel::from_utf8_str("polling_hello"))
+        .await
+        .unwrap();
+    assert_eq!(value, lookup_proof.plaintext_value);
+    let current_azks = reader.retrieve_current_azks().await.unwrap();
+    let root_hash = reader.get_root_hash::<Blake3>(&current_azks).await.unwrap();
+    let pk = reader.get_public_key().await.unwrap();
+    crate::client::lookup_verify::<Blake3>(
+        &pk,
+        root_hash,
+        AkdLabel::from_utf8_str("polling_hello"),
+        lookup_proof,
+    )
+    .unwrap();
 }
